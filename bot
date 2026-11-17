@@ -1,0 +1,186 @@
+import sqlite3
+import asyncio
+from datetime import date, timedelta
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message
+
+TOKEN = "9013471385:AAFWY4QRYmLhVj51bwY06TsaqwdeCYqaES4"
+ADMIN_ID = 1785016117
+
+# На сервере Render VPN не нужен, создаем бота напрямую
+bot = Bot(TOKEN)
+dp = Dispatcher()
+
+# ---------- БД ----------
+conn = sqlite3.connect("artists.db")
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS artists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    nickname TEXT,
+    hashtag TEXT
+)
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    artist_id INTEGER,
+    date TEXT,           -- YYYY-MM-DD
+    count INTEGER,
+    FOREIGN KEY(artist_id) REFERENCES artists(id)
+)
+""")
+conn.commit()
+
+def is_admin(msg: Message) -> bool:
+    return msg.from_user.id == ADMIN_ID
+
+# ---------- Команды ----------
+@dp.message(Command("start"))
+async def start(msg: Message):
+    await msg.answer(
+        "Привет! Я бот учёта художников.\n\n"
+        "Команды:\n"
+        "/add @user Ник #хештег — добавить художника\n"
+        "/list — список художников\n"
+        "/post @user 5 — добавить 5 постов сегодня\n"
+        "/post @user 5 2025-01-15 — добавить за конкретную дату\n"
+        "/stats @user — статистика за 3 месяца\n"
+        "/stats_all — сводка по всем\n"
+        "/del @user — удалить художника"
+    )
+
+@dp.message(Command("add"))
+async def add_artist(msg: Message):
+    if not is_admin(msg):
+        return await msg.answer("⛔ Только для админа")
+    parts = msg.text.split(maxsplit=3)
+    if len(parts) < 4:
+        return await msg.answer("Формат: /add @user Ник #хештег")
+    _, username, nickname, hashtag = parts
+    if not hashtag.startswith("#"):
+        hashtag = "#" + hashtag
+    try:
+        cur.execute(
+            "INSERT INTO artists (username, nickname, hashtag) VALUES (?, ?, ?)",
+            (username.lstrip("@").lower(), nickname, hashtag)
+        )
+        conn.commit()
+        await msg.answer(f"✅ Добавлен {nickname} ({username}) {hashtag}")
+    except sqlite3.IntegrityError:
+        await msg.answer("⚠️ Такой юзер уже есть")
+
+@dp.message(Command("list"))
+async def list_artists(msg: Message):
+    cur.execute("SELECT username, nickname, hashtag FROM artists ORDER BY nickname")
+    rows = cur.fetchall()
+    if not rows:
+        return await msg.answer("Список пуст")
+    text = "🎨 Художники:\n\n" + "\n".join(
+        f"• {nick} (@{u}) {h}" for u, nick, h in rows
+    )
+    await msg.answer(text)
+
+@dp.message(Command("post"))
+async def add_post(msg: Message):
+    if not is_admin(msg):
+        return await msg.answer("⛔ Только для админа")
+    parts = msg.text.split()
+    if len(parts) < 3:
+        return await msg.answer("Формат: /post @user 5 [YYYY-MM-DD]")
+    username = parts[1].lstrip("@").lower()
+    try:
+        count = int(parts[2])
+    except ValueError:
+        return await msg.answer("Количество должно быть числом")
+    d = parts[3] if len(parts) > 3 else date.today().isoformat()
+
+    cur.execute("SELECT id, nickname FROM artists WHERE username=?", (username,))
+    row = cur.fetchone()
+    if not row:
+        return await msg.answer("❌ Художник не найден")
+    artist_id, nickname = row
+
+    # если за эту дату уже есть запись — плюсуем
+    cur.execute("SELECT id, count FROM posts WHERE artist_id=? AND date=?", (artist_id, d))
+    exist = cur.fetchone()
+    if exist:
+        cur.execute("UPDATE posts SET count=count+? WHERE id=?", (count, exist[0]))
+    else:
+        cur.execute("INSERT INTO posts (artist_id, date, count) VALUES (?, ?, ?)",
+                    (artist_id, d, count))
+    conn.commit()
+    await msg.answer(f"✅ {nickname}: +{count} пост(ов) за {d}")
+
+@dp.message(Command("stats"))
+async def stats(msg: Message):
+    parts = msg.text.split()
+    if len(parts) < 2:
+        return await msg.answer("Формат: /stats @user")
+    username = parts[1].lstrip("@").lower()
+    cur.execute("SELECT id, nickname, hashtag FROM artists WHERE username=?", (username,))
+    row = cur.fetchone()
+    if not row:
+        return await msg.answer("❌ Не найден")
+    artist_id, nickname, hashtag = row
+
+    since = (date.today() - timedelta(days=90)).isoformat()
+    cur.execute(
+        "SELECT COALESCE(SUM(count),0), COUNT(*) FROM posts WHERE artist_id=? AND date>=?",
+        (artist_id, since)
+    )
+    total, days = cur.fetchone()
+    
+    if days == 0:
+        await msg.answer(f"📊 {nickname} (@{username}) {hashtag}\nНет данных за 90 дней.")
+    else:
+        await msg.answer(
+            f"📊 {nickname} (@{username}) {hashtag}\n"
+            f"За последние 90 дней: {total} постов\n"
+            f"Активных дней: {days}\n"
+            f"Среднее: {total/days:.1f} в день"
+        )
+
+@dp.message(Command("stats_all"))
+async def stats_all(msg: Message):
+    since = (date.today() - timedelta(days=90)).isoformat()
+    cur.execute("""
+        SELECT a.nickname, a.username, a.hashtag, COALESCE(SUM(p.count),0)
+        FROM artists a
+        LEFT JOIN posts p ON p.artist_id=a.id AND p.date>=?
+        GROUP BY a.id ORDER BY 4 DESC
+    """, (since,))
+    rows = cur.fetchall()
+    if not rows:
+        return await msg.answer("Нет данных")
+    text = "📊 Сводка за 90 дней:\n\n"
+    for nick, u, h, total in rows:
+        text += f"{h} {nick} (@{u}) — {total}\n"
+    await msg.answer(text)
+
+@dp.message(Command("del"))
+async def del_artist(msg: Message):
+    if not is_admin(msg):
+        return await msg.answer("⛔ Только для админа")
+    parts = msg.text.split()
+    if len(parts) < 2:
+        return await msg.answer("Формат: /del @user")
+    username = parts[1].lstrip("@").lower()
+    cur.execute("SELECT id FROM artists WHERE username=?", (username,))
+    row = cur.fetchone()
+    if not row:
+        return await msg.answer("❌ Не найден")
+    cur.execute("DELETE FROM posts WHERE artist_id=?", (row[0],))
+    cur.execute("DELETE FROM artists WHERE id=?", (row[0],))
+    conn.commit()
+    await msg.answer(f"🗑 Удалён @{username} и его записи")
+
+# ---------- Запуск ----------
+async def main():
+    print("Бот запущен")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
